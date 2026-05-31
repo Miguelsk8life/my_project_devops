@@ -1,23 +1,27 @@
 name: Java CI/CD and Docker Packaging with Telegram Alerts
 
-# 1. Definition of Triggers
 on:
   push:
-    branches: [ "main" ]   # Triggered automatically on push to main
+    branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]   # Triggered on pull request to main
-  workflow_dispatch:       # Allows manual trigger from GitHub Web UI
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   build-and-pack:
-    runs-on: ubuntu-latest # Clean Ubuntu environment provided by GitHub
+    runs-on: ubuntu-latest
+
+
+    defaults:
+      run:
+        working-directory: app
 
     steps:
-      # Step 1: Clone the repository code
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2: Install Java 17 for compilation check
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -25,17 +29,17 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
-      # Step 3: Test and build the .jar artifact using Maven
+
       - name: Build with Maven
         run: mvn -B package --file pom.xml
 
-      # Step 4: Build and tag the Docker image (Local packaging)
+
       - name: Build Docker Image
         run: |
           docker build -t my-web-app:${{ github.sha }} .
           docker tag my-web-app:${{ github.sha }} my-web-app:latest
 
-      # Step 5: Telegram Notification on SUCCESS (Now in English)
+
       - name: Send Telegram Notification on Success
         if: success()
         uses: appleboy/telegram-action@master
@@ -49,7 +53,7 @@ jobs:
             📝 Commit: "${{ github.event.head_commit.message }}"
             ✅ The project compiled successfully and the Docker image is ready for deployment.
 
-      # Step 6: Telegram Notification on FAILURE (Now in English)
+
       - name: Send Telegram Notification on Failure
         if: failure()
         uses: appleboy/telegram-action@master
