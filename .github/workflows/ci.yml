@@ -1,5 +1,4 @@
 name: Java CI/CD and Docker Packaging with Telegram Alerts
-
 on:
   push:
     branches: [ "main" ]
@@ -10,7 +9,6 @@ on:
 jobs:
   build-and-pack:
     runs-on: ubuntu-latest
-
 
     defaults:
       run:
