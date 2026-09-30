@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     defaults:
@@ -60,6 +60,22 @@ jobs:
         run: |
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+
+      - name: Update Kubernetes manifest with new image tag
+        if: github.event_name == 'push'
+        working-directory: .
+        run: |
+          sed -i "s|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:.*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|" k8s/app-deployment.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/app-deployment.yaml
+          if git diff --cached --quiet; then
+            echo "No changes to commit (image tag already up to date)."
+          else
+            git commit -m "chore: update web-app image to ${{ github.sha }} [skip ci]"
+            git push
+          fi
 
 
       - name: Send Telegram Notification on Success
