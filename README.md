@@ -1,87 +1,242 @@
-# Итоговая работа: Контейнеризация и централизованное логирование веб-приложения
+# my_project_devops
 
-Данный репозиторий содержит готовую архитектуру для развертывания веб-приложения на Java (Spring Boot) с использованием оптимизированной многоэтапной сборки (**Multistage build**), автоматизации через Bash-скрипты и централизованного сбора логов в связке **Grafana Loki** + **Promtail**.
+Учебный проект по курсу DevOps, доработанный как портфолио-проект для демонстрации практических навыков: контейнеризация, развёртывание в Kubernetes, CI/CD, централизованное логирование и базовая security-гигиена.
 
-## 🛠️ Архитектура системы
+Приложение — простой Spring Boot сервис на Java 17, изначально развёрнутый через Docker Compose (веб-приложение + Loki + Promtail + Grafana). Проект эволюционировал в полноценное развёртывание на Kubernetes с автоматизированным CI/CD-пайплайном.
 
-Вся инфраструктура оркеструется через Docker Compose в единой изолированной сети:
+## Содержание
 
-1. **Web App (Spring Boot):** Веб-приложение на Java 17, упакованное через Multistage Dockerfile.
-2. **Grafana Loki:** Централизованное хранилище логов, оптимизированное для контейнеров.
-3. **Promtail:** Агент, который считывает логи напрямую из Docker демона (`docker.sock`) и отправляет их в Loki.
-4. **Grafana:** Интерфейс для визуализации, фильтрации и анализа логов.
+- [Архитектура](#архитектура)
+- [Предварительные требования](#предварительные-требования)
+- [Docker](#docker)
+- [Kubernetes](#kubernetes)
+- [Развёртывание](#развёртывание)
+- [CI/CD](#cicd)
+- [Логирование](#логирование)
+- [Troubleshooting](#troubleshooting)
+- [Известные ограничения](#известные-ограничения)
+- [Технологии](#технологии)
 
----
-
-## 🚀 Инструкция по запуску и автоматизации
-
-Управление сборкой и развертыванием контейнеров полностью автоматизировано с помощью Bash-скриптов. Скрипты обязательно принимают параметр `-t`, который задает тег (версию) собираемого или запускаемого образа.
-
-### 1. Выдача прав на исполнение
-
-Перед первым запуском в среде WSL/Linux выполните команду:
-
-```bash
-chmod +x scripts/build.sh scripts/deploy.sh
+## Архитектура
 
 ```
-
-### 2. Сборка приложения (Build)
-
-Для сборки Docker-образа с определенным тегом (например, v1.0) выполните:
-
-```bash
-./scripts/build.sh -t v1.0
-
+GitHub push (main)
+        │
+        ▼
+  GitHub Actions
+   ├─ Maven build + test
+   ├─ Docker build (multistage)
+   ├─ Push → GHCR (приватный, тег = commit SHA)
+   └─ Автообновление k8s/app-deployment.yaml новым тегом,
+      коммит обратно в main с [skip ci]
+        │
+        │ image pull (imagePullSecret)
+        ▼
+┌──────────────────────────────────────────────┐
+│         Kubernetes (namespace: devops-portfolio)        │
+│                                                │
+│   Ingress (NGINX Ingress Controller)          │
+│   ├─ web-app.local  → Service web-app:8080    │
+│   └─ grafana.local  → Service grafana:3000    │
+│                                                │
+│   Deployment web-app (replicas: 1, до 2 для   │
+│   демонстрации rolling update / self-healing) │
+│   ├─ readinessProbe / livenessProbe (Actuator)│
+│   ├─ imagePullSecrets: ghcr-cred (Secret)     │
+│   └─ resources: requests/limits               │
+│                                                │
+│   Deployment loki   (эфемерное хранилище)     │
+│   Deployment grafana (Secret + ConfigMap)     │
+│   DaemonSet alloy (1 под на узел)             │
+│   ├─ ServiceAccount + Role + RoleBinding      │
+│   └─ читает логи подов через Kubernetes API   │
+└──────────────────────────────────────────────┘
 ```
 
-*Этот скрипт запускает многоэтапную сборку (Multistage). Тяжелые зависимости Maven остаются во временном слое, а финальный образ на базе Alpine Linux получается максимально легковесным.*
+Полный путь логов: `web-app` (stdout) → Alloy (обнаружение подов через Kubernetes API, не через Docker socket) → Loki (push API) → Grafana (datasource, LogQL-запросы).
 
-### 3. Развертывание инфраструктуры (Deploy)
+## Предварительные требования
 
-Для запуска всех контейнеров в фоновом режиме с указанным тегом выполните:
+- **Docker Desktop** с включённым Kubernetes (backend WSL2 на Windows).
+- Для машин с ограниченными ресурсами (4 CPU / 6GB RAM и меньше) — файл `%USERPROFILE%\.wslconfig`:
+  ```ini
+  [wsl2]
+  memory=3GB
+  processors=3
+  swap=2GB
+  ```
+  После изменения: `wsl --shutdown` и перезапуск Docker Desktop.
+- `kubectl` (устанавливается вместе с Docker Desktop).
+- **NGINX Ingress Controller**, установленный отдельно (см. раздел Kubernetes).
+- GitHub **Personal Access Token (classic)** со scope `read:packages` — для `imagePullSecret`, так как образ в GHCR приватный.
+- Две записи в `hosts`-файле Windows (`C:\Windows\System32\drivers\etc\hosts`, редактировать от имени администратора):
+  ```
+  127.0.0.1 web-app.local
+  127.0.0.1 grafana.local
+  ```
 
-```bash
-./scripts/deploy.sh -t v1.0
+## Docker
 
+Multistage-сборка (`app/Dockerfile`):
+
+```dockerfile
+FROM maven:3.8.6-eclipse-temurin-17 AS builder
+WORKDIR /build
+COPY . .
+RUN mvn clean package -DskipTests
+
+FROM eclipse-temurin:17-jre-alpine
+WORKDIR /app
+COPY --from=builder /build/target/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-Djava.security.egd=file:/dev/./urandom", "-jar", "app.jar"]
 ```
 
-<img alt="scripts_buildsh.png" src="app/screenshots/scripts_buildsh.png"/>
+Финальный образ — JRE Alpine, без Maven и исходного кода. Флаг `-Djava.security.egd=file:/dev/./urandom` — не декоративный, а исправление реальной проблемы (см. Troubleshooting).
 
-<img alt="scripts_deploysh.png" src="app/screenshots/scripts_deploysh.png"/>
+**Версионирование образов**: каждый push в `main` публикует образ в GHCR с двумя тегами — `github.sha` (неизменяемый, используется в манифестах Kubernetes) и `latest` (для удобства). Развёртывание всегда ссылается на конкретный SHA, а не на `latest`, что даёт воспроизводимость: манифест точно говорит, какой коммит сейчас запущен.
 
-### 4. Доступ к сервисам
+**Реестр**: GitHub Container Registry, приватный — `ghcr.io/miguelsk8life/my_project_devops`. Приватность образа не скрывает исходный код (он публичен), а демонстрирует паттерн аутентификации к приватному реестру из кластера (`imagePullSecret`), который встречается в корпоративной практике.
 
-* **Веб-приложение:** http://localhost:8080
-* **Тестовый эндпоинт для логов:** http://localhost:8080/api?name=Miguel
-* **Интерфейс Grafana:** http://localhost:3000 *(Логин: admin / Пароль: admin)*
+## Kubernetes
 
----
+Манифесты — в `k8s/`, без Helm/Kustomize (сознательное решение — на масштабе одного приложения это была бы избыточная сложность).
 
-## 📊 Скриншоты работы (Отчет по выполнению)
+| Файл | Назначение |
+|---|---|
+| `namespace.yaml` | Изолированный namespace `devops-portfolio` |
+| `app-deployment.yaml`, `app-service.yaml` | Основное приложение: Deployment + ClusterIP Service |
+| `loki-deployment.yaml`, `loki-service.yaml` | Loki с конфигурацией по умолчанию, без PVC (см. ниже) |
+| `grafana-configmap.yaml`, `grafana-deployment.yaml`, `grafana-service.yaml` | Grafana, datasource как ConfigMap, пароль как Secret |
+| `alloy-rbac.yaml`, `alloy-configmap.yaml`, `alloy-daemonset.yaml` | Агент логирования (см. раздел Логирование) |
+| `ingress.yaml` | Маршрутизация по hostname |
 
-*Примечание для проверяющего: ниже представлены подтверждения полной работоспособности системы.*
+**Health checks**: приложение изначально не имело Spring Boot Actuator. Добавлена зависимость `spring-boot-starter-actuator` — при работе внутри Kubernetes Spring Boot автоматически обнаруживает окружение (через переменную `KUBERNETES_SERVICE_HOST`) и включает `/actuator/health/liveness` и `/actuator/health/readiness` без дополнительной конфигурации.
 
-### 1. Работоспособное веб-приложение
+**Secrets, не хранящиеся в Git**: `ghcr-cred` (docker-registry secret для imagePullSecret) и `grafana-admin-secret` создаются императивно:
 
-Приложение успешно запущено в контейнере и отвечает на HTTP-запросы из браузера Хоста (Windows).
-<img alt="app_web.png" src="app/screenshots/app_web.png"/>
+```bash
+kubectl create secret docker-registry ghcr-cred \
+  --docker-server=ghcr.io \
+  --docker-username=<github-username> \
+  --docker-password=<PAT с read:packages> \
+  --namespace=devops-portfolio
 
-<img alt="api.png" src="app/screenshots/api.png"/>
+kubectl create secret generic grafana-admin-secret \
+  --from-literal=admin-password='<пароль>' \
+  --namespace=devops-portfolio
+```
 
-### 2. Запущенные контейнеры в Docker
+**Персистентность**: ни Loki, ни Grafana не используют `PersistentVolumeClaim`. Это осознанное решение, а не упущение — в исходном `docker-compose.yml` у этих сервисов тоже не было volume-монтирования, то есть логи и так были эфемерными. Копирование того же поведения в Kubernetes сохраняет паритет с исходной архитектурой без добавления сложности, которая не была нужна изначально.
 
-Результат выполнения команды `docker compose ps`, подтверждающий, что все 4 контейнера (приложение, loki, promtail, grafana) находятся в статусе Up.
-<img alt="docker_compose_ps.png" src="app/screenshots/docker_compose_ps.png"/>
+**Ingress Controller** — устанавливается отдельно (не наш собственный манифест, а официальный от проекта kubernetes/ingress-nginx):
 
-### 3. Просмотр логов веб-приложения через Grafana
+```bash
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.15.1/deploy/static/provider/cloud/deploy.yaml
+```
 
-Логирование успешно централизовано. Вкладка Explore в Grafana, выбран источник данных Loki, установлен фильтр по тегу контейнера `{container="my_project_devops-web-app-1"}`. Четко видны логи уровней INFO и WARN, поступающие из Spring Boot.
-<img alt="loki.png" src="app/screenshots/loki.png"/>
----
+Выбран NGINX как наиболее стандартный вариант с широкой документацией. Docker Desktop автоматически пробрасывает Service типа `LoadBalancer` на `localhost`, поэтому дополнительная настройка не требуется.
 
-## 🔒 Использованные DevOps практики
+## Развёртывание
 
-* **Multistage Build:** Оптимизация размера и безопасности итогового образа за счет разделения этапа сборки (maven) и этапа запуска (eclipse-temurin JRE alpine). В финальном контейнере нет лишнего исходного кода и инструментов сборки.
-* **Infrastructure as Code (IaC):** Автоматическое добавление источника данных Loki в Grafana при запуске через конфигурационный файл datasource.yml (без ручной настройки через веб-интерфейс).
-* **Динамическое тегирование:** Параметризация CI/CD пайплайна с помощью Bash-скриптов и флагов -t для контроля версий артефактов.
+```bash
+kubectl apply -f k8s/namespace.yaml
+# создать Secrets (см. выше)
+kubectl apply -f k8s/app-deployment.yaml -f k8s/app-service.yaml
+kubectl apply -f k8s/loki-deployment.yaml -f k8s/loki-service.yaml
+kubectl apply -f k8s/grafana-configmap.yaml -f k8s/grafana-deployment.yaml -f k8s/grafana-service.yaml
+kubectl apply -f k8s/alloy-rbac.yaml -f k8s/alloy-configmap.yaml -f k8s/alloy-daemonset.yaml
+kubectl apply -f k8s/ingress.yaml
+```
+
+Проверка:
+
+```bash
+kubectl get pods -n devops-portfolio
+kubectl get deployments -n devops-portfolio
+kubectl get services -n devops-portfolio
+kubectl rollout status deployment/web-app -n devops-portfolio
+```
+
+Демонстрация rolling update / self-healing:
+
+```bash
+kubectl scale deployment/web-app --replicas=2 -n devops-portfolio
+# ... наблюдать rolling update, self-healing ...
+kubectl scale deployment/web-app --replicas=1 -n devops-portfolio
+```
+
+## CI/CD
+
+Workflow `.github/workflows/ci.yml`:
+
+```
+git push (main)
+     ↓
+Checkout → Maven build/test → Docker build
+     ↓
+docker login ghcr.io (GITHUB_TOKEN, packages:write)
+     ↓
+docker push (:sha и :latest)
+     ↓
+sed обновляет image: в k8s/app-deployment.yaml
+     ↓
+git commit "chore: update web-app image to <sha> [skip ci]"
+     ↓
+git push (обратно в main)
+     ↓
+Telegram-уведомление
+```
+
+Ключевые решения:
+
+- **`permissions: contents: write`** — минимально необходимое расширение прав `GITHUB_TOKEN` для автокоммита; не требует дополнительного PAT.
+- **`[skip ci]`** в сообщении автокоммита — без этого пуш workflow обратно в `main` вызвал бы бесконечный цикл запусков.
+- **Push в GHCR только на событии `push`, не на `pull_request`** — сборка и тесты выполняются на PR, но публикация образа — только после мержа в `main`.
+- **Почему не полный `kubectl apply` из CI**: кластер Kubernetes выполняется локально (Docker Desktop), а GitHub Actions — в облаке GitHub. Раннер в облаке не может напрямую обратиться к кластеру за домашней сетью без дополнительной инфраструктуры (self-hosted runner). Решение — CI обновляет манифест и коммитит изменение; применение к кластеру (`kubectl apply`) выполняется вручную. Это честный компромисс для локального кластера одного разработчика, а не полный GitOps-цикл.
+
+## Логирование
+
+Изначально Promtail (Docker Compose) использовал `docker_sd_configs` и монтирование `/var/run/docker.sock`. При переносе в Kubernetes от этого подхода намеренно отказались:
+
+1. Promtail достиг **End-of-Life 2 марта 2026 года** — больше не получает обновлений и патчей безопасности. Заменён на **Grafana Alloy**.
+2. Alloy обнаруживает поды через **Kubernetes API** (`loki.source.kubernetes`), а не через монтирование файловой системы узла — не требует `hostPath` или privileged-доступа.
+3. RBAC ограничен минимально необходимым: `Role` (не `ClusterRole`) в пределах одного namespace, только `get/list/watch` на `pods` и `get` на `pods/log`.
+
+Пример LogQL-запроса в Grafana Explore:
+
+```
+{namespace="devops-portfolio", pod=~"web-app.*"}
+```
+
+## Troubleshooting
+
+Реальные инциденты, с которыми столкнулись при развёртывании (не гипотетические — каждый воспроизведён и исправлен):
+
+**Под `web-app` не проходит liveness/readiness probe, `connection refused`.**
+Причина: классическая проблема нехватки энтропии (`SecureRandom`) при инициализации Tomcat внутри контейнера — время старта доходило до 76 секунд вместо ожидаемых 2–5. Исправление: флаг JVM `-Djava.security.egd=file:/dev/./urandom` в `ENTRYPOINT` — снизил время старта до ~13 секунд.
+
+**Alloy не собирает логи, хотя запускается без ошибок.**
+Причина: в конфигурации Alloy использовалась переменная `sys.env("HOSTNAME")` в надежде получить имя узла Kubernetes — но `HOSTNAME` внутри контейнера возвращает имя **пода**, а не узла. В результате фильтр `spec.nodeName=...` не находил ни одного пода. Исправление: имя узла получено через Downward API (`fieldRef: fieldPath: spec.nodeName`) в переменную `NODE_NAME`.
+
+**Периодические рестарты `web-app` (`context deadline exceeded`, затем `connection refused`) после добавления стека наблюдаемости.**
+Причина: нехватка ресурсов на локальной машине (4 CPU / 6GB RAM) при одновременном выполнении 5 компонентов (web-app ×2, loki, grafana, alloy). Решения: увеличение `timeoutSeconds` у проб, тюнинг `.wslconfig` для WSL2, и снижение `replicas` до 1 для повседневной работы (масштабирование до 2 — только для демонстрации).
+
+**GHCR-пакет опубликовался как `Public`, хотя ожидалась приватность.**
+GHCR иногда делает пакет публичным по умолчанию при первой публикации через Actions независимо от scope токена. Исправлено вручную через Package settings → Danger Zone → Change visibility.
+
+**Предупреждения `LF will be replaced by CRLF` при `git add`.**
+Безвредно — связано с `core.autocrlf` в Git для Windows, нормализующим переносы строк. Не влияет на содержимое файлов.
+
+## Известные ограничения
+
+Честно о том, что **не** реализовано, и почему:
+
+- Контейнер `web-app` всё ещё выполняется от `root` — non-root `USER` в Dockerfile не добавлен (следующий шаг для security-гигиены).
+- `readOnlyRootFilesystem` и `securityContext` для подов не настроены.
+- HPA (Horizontal Pod Autoscaler) не реализован — для одного Deployment с фиксированной нагрузкой не было практической необходимости.
+- Полный GitOps-цикл (автоматический `kubectl apply` из CI) не реализован — требует self-hosted runner с доступом к локальному кластеру (см. раздел CI/CD).
+
+## Технологии
+
+Java 17 · Spring Boot 3.2.5 · Maven · Docker (multistage builds) · Kubernetes (Deployment, Service, ConfigMap, Secret, Ingress, RBAC, DaemonSet, Namespace) · GitHub Actions · GitHub Container Registry · Grafana Loki · Grafana Alloy · Grafana · NGINX Ingress Controller
