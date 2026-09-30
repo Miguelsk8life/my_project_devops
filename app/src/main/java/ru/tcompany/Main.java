@@ -25,6 +25,7 @@ public class Main {
     public String home() {
         logger.info("Received a request at the root endpoint [/]");
         return "<h1>Hello! The web application for the DevOps task is working correctly.</h1>" +
+                "<p>Deployed to Kubernetes via automated CI/CD.</p>" +
                 "<p>Try going to <a href='/api?name=Miguel'>/api?name=Miguel</a> to generate more logs.</p>";
     }
 
@@ -34,3 +35,4 @@ public class Main {
         return String.format("{\"status\": \"success\", \"message\": \"Hello %s, processing your DevOps request\"}", name);
     }
 }
+
