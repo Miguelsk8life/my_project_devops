@@ -19,7 +19,7 @@ spec:
         - name: ghcr-cred
       containers:
         - name: web-app
-          image: ghcr.io/miguelsk8life/my_project_devops:c2249699b61688db82f8797fc2f571f93f42558f
+          image: ghcr.io/miguelsk8life/my_project_devops:550c8a036b4413704700869eb02a7ab0f64a7e4b
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
